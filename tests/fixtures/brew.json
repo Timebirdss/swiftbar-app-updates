@@ -1,0 +1,11 @@
+{
+  "formulae": [
+    { "name": "brotli", "installed_versions": ["1.2.0"], "current_version": "1.2.1", "pinned": false, "pinned_version": null },
+    { "name": "git", "installed_versions": ["2.47.0"], "current_version": "2.48.1", "pinned": false, "pinned_version": null }
+  ],
+  "casks": [
+    { "name": "dbeaver-community", "installed_versions": ["26.2.1"], "current_version": "26.2.3", "pinned": false, "pinned_version": null },
+    { "name": "zed", "installed_versions": ["1.22.0"], "current_version": "1.26.2", "pinned": false, "pinned_version": null },
+    { "name": "electerm", "installed_versions": ["5.5.76"], "current_version": "5.8.0", "pinned": false, "pinned_version": null }
+  ]
+}

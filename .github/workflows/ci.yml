@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+
+      - name: ShellCheck
+        run: shellcheck -S warning bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh tests/run.sh
+
+      - name: Syntax check
+        run: bash -n bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh tests/run.sh
+
+      - name: Tests
+        run: ./tests/run.sh

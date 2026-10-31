@@ -1,0 +1,565 @@
+#!/bin/bash
+# app-updates — Homebrew and Mac App Store updates in your SwiftBar menu bar.
+#
+#   app-updates                      menu for SwiftBar (cache only, no network)
+#   app-updates refresh [--quiet]    check brew + mas and rewrite the cache
+#   app-updates upgrade-all          upgrade everything in the list, one by one
+#   app-updates upgrade formula NAME upgrade one Homebrew formula
+#   app-updates upgrade cask NAME    upgrade one Homebrew cask
+#   app-updates upgrade mas ID       upgrade one Mac App Store app
+#   app-updates cleanup              brew cleanup and report freed space
+#   app-updates skip NAME VERSION    stop offering this version
+#   app-updates term <cmd> [args]    run a command in Terminal via a .command file
+#
+# MIT License, see LICENSE.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# --- where things live -------------------------------------------------------
+CACHE="${APP_UPDATES_CACHE:-${XDG_CACHE_HOME:-$HOME/Library/Caches}/app-updates}"
+CONF="${APP_UPDATES_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/app-updates/config}"
+STATE="${APP_UPDATES_STATE:-$CACHE/state.json}"
+LOG="$CACHE/refresh.log"
+LOCK="$CACHE/lock"
+RAW_MAS="$CACHE/mas.jsonl"
+BREW_TS="$CACHE/brew-update.ts"
+
+PLUGIN="app-updates"   # plugin file name without the .5m.sh suffix
+
+# SwiftBar starts plugins with a minimal PATH, so resolve tools explicitly.
+pick() {
+  local c
+  for c in "$@"; do
+    [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+BREW=$(pick "$(command -v brew 2>/dev/null)" /opt/homebrew/bin/brew /usr/local/bin/brew) || BREW=""
+JQ=$(pick "$(command -v jq 2>/dev/null)" /opt/homebrew/bin/jq /usr/local/bin/jq) || JQ=""
+MAS=$(pick "$(command -v mas 2>/dev/null)" /opt/homebrew/bin/mas /usr/local/bin/mas) || MAS=""
+OPEN=$(pick /usr/bin/open) || OPEN="open"
+OSA=$(pick /usr/bin/osascript) || OSA="osascript"
+DATE=$(pick /bin/date) || DATE="date"
+
+if [ -z "$JQ" ]; then
+  printf 'app-updates: jq is required (brew install jq)\n' >&2
+  exit 1
+fi
+
+# brew's curl has no timeout, so a stalled mirror hangs it forever.
+TIMEOUT_BIN=$(pick /opt/homebrew/bin/gtimeout /opt/homebrew/opt/coreutils/libexec/gnubin/timeout) || TIMEOUT_BIN=""
+FORMULA_TIMEOUT=1800   # source builds can take a while
+CASK_TIMEOUT=600
+MAS_TIMEOUT=600
+
+# Defaults; the config file may override any of them.
+PROXY=""
+IGNORE=""
+SKIP=""
+TTL=21600              # check at most every 6 hours
+STALE_AFTER=43200      # show "data is stale" after 12 hours
+BREW_UPDATE_TTL=21600  # brew update at most every 6 hours
+LOG_MAX=262144         # rotate the log at 256 KB
+
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+if [ -n "${PROXY:-}" ]; then
+  export ALL_PROXY="$PROXY" all_proxy="$PROXY"
+  export http_proxy="$PROXY" https_proxy="$PROXY"
+fi
+
+SELF=$0
+case "$SELF" in
+  /*) ;;
+  *) SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")" ;;
+esac
+
+mkdir -p "$CACHE" 2>/dev/null
+writable() { [ -d "$CACHE" ] && [ -w "$CACHE" ]; }
+
+now() { "$DATE" +%s; }
+
+run_limited() {
+  local secs=$1
+  shift
+  if [ -n "$TIMEOUT_BIN" ]; then "$TIMEOUT_BIN" -k 10 "$secs" "$@"; else "$@"; fi
+}
+
+log() { printf '%s %s\n' "$("$DATE" '+%F %T')" "$*" >>"$LOG" 2>/dev/null; }
+
+notify() {
+  "$OSA" -e 'on run argv
+    display notification (item 2 of argv) with title (item 1 of argv)
+  end run' "$1" "$2" >/dev/null 2>&1
+}
+
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  [ "$(wc -c <"$LOG" 2>/dev/null | tr -d ' ')" -gt "$LOG_MAX" ] && : >"$LOG"
+}
+
+human_age() {
+  local s=$1
+  if [ "$s" -lt 60 ]; then printf 'just now'
+  elif [ "$s" -lt 3600 ]; then printf '%s min ago' "$((s / 60))"
+  elif [ "$s" -lt 86400 ]; then printf '%s h ago' "$((s / 3600))"
+  else printf '%s d ago' "$((s / 86400))"; fi
+}
+
+# --- pure transformations (covered by tests/run.sh) --------------------------
+# stdin: `brew outdated --json=v2` → {formulae:[{name,from,to}], casks:[{...,auto}]}
+norm_brew() {
+  "$JQ" -c '
+    {formulae: [(.formulae // [])[] | {name: .name, from: (.installed_versions // []), to: (.current_version // "")}],
+     casks:    [(.casks    // [])[] | {name: .name, from: (.installed_versions // []), to: (.current_version // ""), auto: (.auto // false)}]}'
+}
+
+# stdin: NDJSON from `mas outdated --json` → [{id,name,from,to}]
+norm_mas() {
+  "$JQ" -s -c '[.[] | {id: .adamID, name: .name, from: (.version // ""), to: (.newVersion // "")}]'
+}
+
+# $1: space separated package names; stdin: normalized brew JSON
+filter_ignore() {
+  "$JQ" -c --argjson skip "$("$JQ" -n --arg s "${1:-}" '$s | split(" ") | map(select(length > 0))')" '
+    .formulae = [(.formulae // [])[] | select(.name as $n | $skip | index($n) | not)]
+    | .casks = [(.casks // [])[] | select(.name as $n | $skip | index($n) | not)]'
+}
+
+# $1: "name=version ..."; stdin: normalized brew JSON. Empty version skips forever.
+filter_skip() {
+  "$JQ" -c --argjson sk "$("$JQ" -n --arg s "${1:-}" '$s | split(" ") | map(select(length > 0)) | map(split("=")) | map({name: .[0], version: (.[1] // "")})')" '
+    def skipped($n; $v): any($sk[]; .name == $n and (.version == "" or .version == $v));
+    .formulae = [(.formulae // [])[] | select(skipped(.name; (.to // "")) | not)]
+    | .casks = [(.casks // [])[] | select(skipped(.name; (.to // "")) | not)]'
+}
+
+# Which casks update themselves (Zed, Chrome, DBeaver…): brew upgrade is optional there.
+mark_auto_casks() {
+  local file=$1 c au au_json="{}" t0
+  [ -s "$file" ] || return 0
+  [ -n "$BREW" ] || return 0
+  [ "$("$JQ" -r '(.casks // []) | length' "$file" 2>/dev/null)" != "0" ] || return 0
+  t0=$(now)
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    au=$("$BREW" info --json=v2 --cask "$c" 2>/dev/null | "$JQ" -r '.casks[0].auto_updates // false' 2>/dev/null)
+    au_json=$("$JQ" -c --arg n "$c" --argjson a "${au:-false}" '. + {($n): $a}' <<<"$au_json")
+  done < <("$JQ" -r '.casks[]?.name' "$file" 2>/dev/null)
+  "$JQ" --argjson au "$au_json" '.casks = [(.casks // [])[] | . + {auto: ($au[.name] // false)}]' \
+    "$file" >"$file.tmp" 2>>"$LOG" && mv "$file.tmp" "$file"
+  log "auto_updates: $(( $(now) - t0 )) s"
+}
+
+# --- one check at a time -----------------------------------------------------
+acquire_lock() {
+  if mkdir "$LOCK" 2>/dev/null; then
+    printf '%s\n' "$$" >"$LOCK/pid"
+    return 0
+  fi
+  local pid mtime age
+  pid=$(cat "$LOCK/pid" 2>/dev/null)
+  mtime=$(/usr/bin/stat -f %m "$LOCK" 2>/dev/null || /usr/bin/stat -c %Y "$LOCK" 2>/dev/null || echo 0)
+  case "$mtime" in '' | *[!0-9]*) mtime=0 ;; esac
+  age=$(( $(now) - mtime ))
+  [ "$age" -lt 0 ] && age=0
+  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null && [ "$age" -lt 86400 ]; then
+    return 1
+  fi
+  log "stale lock removed (pid=${pid:-?}, ${age}s)"
+  rm -rf "$LOCK"
+  mkdir "$LOCK" 2>/dev/null && {
+    printf '%s\n' "$$" >"$LOCK/pid"
+    return 0
+  }
+  return 1
+}
+
+release_lock() { rm -rf "$LOCK" 2>/dev/null; }
+
+refresh_ui() { "$OPEN" -g "swiftbar://refreshplugin?name=$PLUGIN" >/dev/null 2>&1; return 0; }
+
+# --- check -------------------------------------------------------------------
+cmd_refresh() {
+  local quiet=0
+  [ "${1:-}" = "--quiet" ] && quiet=1
+
+  writable || {
+    printf 'cannot write to %s\n' "$CACHE" >&2
+    return 1
+  }
+
+  if ! acquire_lock; then
+    log "refresh skipped: another check is running"
+    [ "$quiet" -eq 1 ] || printf 'A check is already running.\n'
+    return 0
+  fi
+  trap release_lock EXIT
+
+  rotate_log
+  log "refresh: start"
+
+  local err="" brew_ok=0 mas_ok=0 t0 last_bu age_bu
+  local raw="$CACHE/brew.raw.json" norm="$CACHE/brew.norm.json" masnorm="$CACHE/mas.norm.json"
+
+  # Fresh taps: without this `brew outdated` happily reports last year's versions.
+  last_bu=$(cat "$BREW_TS" 2>/dev/null || echo 0)
+  case "$last_bu" in '' | *[!0-9]*) last_bu=0 ;; esac
+  age_bu=$(( $(now) - last_bu ))
+  if [ -n "$BREW" ] && [ "$age_bu" -ge "$BREW_UPDATE_TTL" ]; then
+    t0=$(now)
+    if "$BREW" update --quiet >>"$LOG" 2>&1; then
+      now >"$BREW_TS"
+      log "brew update: $(( $(now) - t0 )) s"
+    else
+      log "brew update: failed"
+    fi
+  fi
+
+  if [ -n "$BREW" ]; then
+    t0=$(now)
+    if HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" outdated --json=v2 --greedy >"$raw.tmp" 2>>"$LOG"; then
+      mv "$raw.tmp" "$raw"
+      brew_ok=1
+    else
+      rm -f "$raw.tmp"
+      err="${err}brew outdated failed. "
+    fi
+    log "brew outdated: $(( $(now) - t0 )) s"
+  else
+    err="${err}brew not found. "
+  fi
+
+  if [ -n "$MAS" ]; then
+    # `mas` prints one JSON object per line, not an array. MAS_NO_AUTO_INDEX
+    # keeps the check from triggering a Spotlight re-index.
+    if MAS_NO_AUTO_INDEX=1 "$MAS" outdated --json >"$RAW_MAS.tmp" 2>>"$LOG"; then
+      mv "$RAW_MAS.tmp" "$RAW_MAS"
+      mas_ok=1
+    else
+      rm -f "$RAW_MAS.tmp"
+      err="${err}App Store did not answer (mas outdated). "
+    fi
+  else
+    err="${err}mas not found. "
+  fi
+
+  # raw → normalized → self-updating flags → IGNORE → SKIP
+  if [ -s "$raw" ]; then
+    norm_brew <"$raw" >"$norm.tmp" 2>>"$LOG" && mv "$norm.tmp" "$norm"
+    [ -s "$norm" ] || printf '{"formulae":[],"casks":[]}' >"$norm"
+    mark_auto_casks "$norm"
+    filter_ignore "$IGNORE" <"$norm" >"$norm.tmp" 2>>"$LOG" && mv "$norm.tmp" "$norm"
+    filter_skip "$SKIP" <"$norm" >"$norm.tmp" 2>>"$LOG" && mv "$norm.tmp" "$norm"
+  else
+    printf '{"formulae":[],"casks":[]}' >"$norm"
+  fi
+
+  [ -f "$RAW_MAS" ] || : >"$RAW_MAS"
+  norm_mas <"$RAW_MAS" >"$masnorm.tmp" 2>>"$LOG" && mv "$masnorm.tmp" "$masnorm"
+  [ -s "$masnorm" ] || printf '[]' >"$masnorm"
+
+  local n_f n_c n_m
+  n_f=$("$BREW" list --formula 2>/dev/null | wc -l | tr -d ' ')
+  n_c=$("$BREW" list --cask 2>/dev/null | wc -l | tr -d ' ')
+  n_m=$("$MAS" list 2>/dev/null | wc -l | tr -d ' ')
+  case "$n_f" in '' | *[!0-9]*) n_f=0 ;; esac
+  case "$n_c" in '' | *[!0-9]*) n_c=0 ;; esac
+  case "$n_m" in '' | *[!0-9]*) n_m=0 ;; esac
+
+  "$JQ" -n \
+    --argjson ts "$(now)" \
+    --argjson bok "$brew_ok" \
+    --argjson mok "$mas_ok" \
+    --argjson nf "$n_f" --argjson nc "$n_c" --argjson nm "$n_m" \
+    --arg err "$err" --arg v "$VERSION" \
+    --slurpfile b "$norm" --slurpfile m "$masnorm" '
+      {version: $v, ts: $ts,
+       brew: {ok: ($bok == 1), formulae: ($b[0].formulae // []), casks: ($b[0].casks // [])},
+       mas: {ok: ($mok == 1), apps: ($m[0] // [])},
+       installed: {formulae: $nf, casks: $nc, mas: $nm},
+       error: $err}' >"$STATE.tmp" 2>>"$LOG" && mv "$STATE.tmp" "$STATE"
+
+  log "refresh: done (brew=$brew_ok, mas=$mas_ok, errors=${err:-none})"
+  [ "$quiet" -eq 1 ] || printf 'Check finished.\n'
+  refresh_ui
+  return 0
+}
+
+# --- upgrade -----------------------------------------------------------------
+cmd_upgrade() {
+  local kind=${1:-} id=${2:-} rc=0
+  case "$kind" in
+    formula) run_limited "$FORMULA_TIMEOUT" "$BREW" upgrade "$id" || rc=$? ;;
+    cask) run_limited "$CASK_TIMEOUT" "$BREW" upgrade --cask --greedy "$id" || rc=$? ;;
+    mas) run_limited "$MAS_TIMEOUT" "$MAS" update "$id" || rc=$? ;;
+    *)
+      printf 'unknown target: %s %s\n' "$kind" "$id" >&2
+      return 2
+      ;;
+  esac
+
+  printf '\n== Re-checking…\n'
+  cmd_refresh --quiet
+
+  if [ "$rc" -eq 0 ]; then
+    notify "app-updates" "Updated: $id"
+  elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    printf '%s did not finish in time — network or a stalled mirror, aborted.\n' "$id"
+    notify "app-updates" "$id: timed out, aborted"
+  else
+    printf '%s failed (exit %s), see the output above.\n' "$id" "$rc"
+    notify "app-updates" "$id: upgrade failed ($rc)"
+  fi
+  refresh_ui
+  return "$rc"
+}
+
+cmd_upgrade_all() {
+  local failed="" name id
+
+  printf '== Upgrading everything in the list ==\n\n'
+
+  if [ ! -s "$STATE" ]; then
+    printf 'checking first…\n'
+    cmd_refresh --quiet
+  fi
+
+  printf '─ Homebrew formulae\n'
+  while IFS= read -r name; do
+    [ -n "${name:-}" ] || continue
+    printf '  + %s\n' "$name"
+    run_limited "$FORMULA_TIMEOUT" "$BREW" upgrade "$name" || failed="$failed$name "
+  done < <("$JQ" -r '.brew.formulae[]?.name' "$STATE" 2>/dev/null)
+
+  printf '\n─ Homebrew applications\n'
+  while IFS= read -r name; do
+    [ -n "${name:-}" ] || continue
+    printf '  + %s\n' "$name"
+    run_limited "$CASK_TIMEOUT" "$BREW" upgrade --cask --greedy "$name" || failed="$failed$name "
+  done < <("$JQ" -r '.brew.casks[]? | select(.auto != true) | .name' "$STATE" 2>/dev/null)
+
+  printf '\n─ Mac App Store\n'
+  while IFS= read -r id; do
+    [ -n "${id:-}" ] || continue
+    printf '  + %s\n' "$id"
+    run_limited "$MAS_TIMEOUT" "$MAS" update "$id" || failed="$failed App Store#$id "
+  done < <("$JQ" -r '.mas.apps[]?.id' "$STATE" 2>/dev/null)
+
+  printf '\n== Re-checking…\n'
+  cmd_refresh --quiet
+
+  if [ -n "$failed" ]; then
+    printf '\nFailed: %s\n' "${failed% }"
+    notify "app-updates" "Some upgrades failed: ${failed% }"
+  else
+    printf '\nDone: everything is up to date.\n'
+    notify "app-updates" "All available updates installed"
+  fi
+  refresh_ui
+}
+
+# --- terminal, skip, cleanup -------------------------------------------------
+# Terminal is opened via a .command file: SwiftBar's own "run in Terminal"
+# fails with AppleScript -1728 when Terminal has no windows.
+cmd_term() {
+  local sub=${1:-} f
+  shift || true
+  [ -n "$sub" ] || exit 2
+  f="$CACHE/run-$sub.command"
+  {
+    echo '#!/bin/bash'
+    printf 'exec'
+    printf ' %q' "$SELF" "$sub" "$@"
+    echo
+  } >"$f"
+  chmod +x "$f"
+  "$OPEN" "$f" 2>/dev/null
+}
+
+cmd_skip() {
+  local name=$1 ver=${2:-} tmp
+  [ -n "${name:-}" ] || return 2
+  mkdir -p "$(dirname "$CONF")" 2>/dev/null
+  if [ -f "$CONF" ] && grep -q '^SKIP=' "$CONF"; then
+    tmp=$(mktemp) || return 1
+    awk -v add="$name=$ver" '
+      /^SKIP=/ {
+        val = $0
+        sub(/^SKIP="/, "", val); sub(/"$/, "", val)
+        if (val == "") val = add; else val = val " " add
+        print "SKIP=\"" val "\""
+        next
+      }
+      { print }
+    ' "$CONF" >"$tmp" && mv "$tmp" "$CONF"
+  else
+    printf '\n# Skipped versions (name=version), space separated\nSKIP="%s=%s"\n' "$name" "$ver" >>"$CONF"
+  fi
+  # shellcheck source=/dev/null
+  [ -f "$CONF" ] && . "$CONF"
+  notify "app-updates" "Skipping $name $ver"
+  log "skip: $name=$ver"
+  cmd_refresh --quiet
+  refresh_ui
+}
+
+cmd_cleanup() {
+  local out freed
+  out=$(run_limited 900 "$BREW" cleanup --prune=all 2>&1) || true
+  printf '%s\n' "$out" | tail -3
+  freed=$(printf '%s\n' "$out" | /usr/bin/sed -n 's/.*free[ds]* approximately \(.*\) of disk space.*/\1/p' | tail -1)
+  log "cleanup: ${freed:-nothing to free}"
+  notify "app-updates" "Cleanup: ${freed:-nothing to free}"
+  refresh_ui
+}
+
+# --- menu --------------------------------------------------------------------
+spawn_refresh() { nohup "$SELF" refresh --quiet >/dev/null 2>&1 & }
+
+cmd_menu() {
+  local now_s age
+
+  if [ ! -f "$STATE" ] || ! "$JQ" -e . "$STATE" >/dev/null 2>&1; then
+    echo "… | sfimage=arrow.triangle.2.circlepath sfcolor=gray tooltip=\"Checking for updates…\""
+    echo "---"
+    echo "**First check** | size=13 md=true"
+    echo "Asking Homebrew and the App Store, a few seconds | color=gray size=11"
+    echo "---"
+    echo "Check now | bash=$SELF param1=refresh terminal=false sfimage=arrow.clockwise"
+    spawn_refresh
+    return 0
+  fi
+
+  # One jq pass for the whole menu: opening it must not wait for five processes.
+  local map meta
+  map=$("$JQ" -r '
+    "META\u001f\(.ts // 0)\u001f\((.brew.formulae // []) | length)\u001f\(([(.brew.casks // [])[] | select(.auto != true)] | length))\u001f\(([(.brew.casks // [])[] | select(.auto == true)] | length))\u001f\((.mas.apps // []) | length)\u001f\(.installed.formulae // 0)\u001f\(.installed.casks // 0)\u001f\(.installed.mas // 0)\u001f\([.brew.formulae[].name, ((.brew.casks // [])[] | select(.auto != true) | .name), ((.mas.apps // [])[] | .name)] | if length > 7 then .[0:7] + ["…"] else . end | join(", "))\u001f\(.error // "")",
+    ((.brew.formulae // [])[] | ["formula", .name, .name, ((.from // []) | join(", ")), .to] | join("\u001f")),
+    ((.brew.casks // [])[] | (if .auto == true then ["cask_auto", .name, .name, ((.from // []) | join(", ")), .to] else ["cask", .name, .name, ((.from // []) | join(", ")), .to] end) | join("\u001f")),
+    ((.mas.apps // [])[] | ["mas", (.id | tostring), .name, .from, .to] | join("\u001f"))
+  ' "$STATE" 2>/dev/null)
+
+  if [ -z "$map" ]; then
+    echo "| sfimage=exclamationmark.triangle.fill sfcolor=orange tooltip=\"Unreadable cache\""
+    echo "---"
+    echo "Cannot read cache: $STATE"
+    echo "Check now | bash=$SELF param1=refresh terminal=false sfimage=arrow.clockwise"
+    return 0
+  fi
+
+  local _m ts nf nc nca nm inst_f inst_c inst_m names err n
+  meta=$(printf '%s\n' "$map" | head -n 1)
+  IFS=$'\x1f' read -r _m ts nf nc nca nm inst_f inst_c inst_m names err <<<"$meta"
+  case "$ts" in '' | *[!0-9]*) ts=0 ;; esac
+  case "$nf" in '' | *[!0-9]*) nf=0 ;; esac
+  case "$nc" in '' | *[!0-9]*) nc=0 ;; esac
+  case "$nca" in '' | *[!0-9]*) nca=0 ;; esac
+  case "$nm" in '' | *[!0-9]*) nm=0 ;; esac
+  n=$((nf + nc + nm))
+
+  now_s=$(now)
+  age=$((now_s - ts))
+  [ "$age" -lt 0 ] && age=0
+
+  # The plugin schedules its own checks, but never more often than TTL.
+  if [ "$age" -ge "$TTL" ] && ! [ -d "$LOCK" ] && writable && command -v nohup >/dev/null 2>&1; then
+    spawn_refresh
+  fi
+
+  local age_str summary note="" word
+  age_str=$(human_age "$age")
+  summary="Checked $age_str · scanned: ${inst_f} formulae, ${inst_c} casks, ${inst_m} App Store apps"
+  [ -d "$LOCK" ] && summary="$summary · checking…"
+  [ "$age" -ge "$STALE_AFTER" ] && summary="$summary · data is stale"
+  [ "$nca" -gt 0 ] && note="\\nSelf-updating: $nca (left alone by brew)"
+
+  if [ "$n" -gt 0 ]; then
+    [ "$n" -eq 1 ] && word="update" || word="updates"
+    echo "$n | sfimage=arrow.down.circle.fill sfcolor=orange tooltip=\"$n $word: ${names:-see the list}\\nChecked $age_str$note\""
+  elif [ -n "$err" ]; then
+    echo "| sfimage=exclamationmark.triangle.fill sfcolor=orange tooltip=\"Check incomplete: $err\\nChecked $age_str\""
+  else
+    echo "| sfimage=arrow.down.circle sfcolor=gray tooltip=\"No updates · checked $age_str$note\""
+  fi
+  echo "---"
+
+  if [ -n "$err" ]; then
+    echo "Check was incomplete | color=red sfimage=exclamationmark.triangle"
+    echo "-- $err | color=gray size=11"
+    echo "---"
+  fi
+
+  if [ "$n" -gt 0 ]; then
+    echo "**Updates: $n** | size=13 md=true"
+    echo "$summary | color=gray size=11"
+    echo "---"
+    echo "Upgrade all ($n) | bash=$SELF param1=term param2=upgrade-all terminal=false sfimage=arrow.up.circle.fill color=orange tooltip=\"Formulae, then apps, then App Store. Self-updating apps are skipped.\""
+    echo "Check now | bash=$SELF param1=refresh terminal=false sfimage=arrow.clockwise tooltip=\"brew update + brew outdated + mas outdated\""
+    echo "---"
+  else
+    echo "**Everything is up to date** | size=13 md=true"
+    echo "$summary | color=gray size=11"
+    echo "---"
+    echo "Check now | bash=$SELF param1=refresh terminal=false sfimage=arrow.clockwise tooltip=\"brew update + brew outdated + mas outdated\""
+  fi
+
+  local tag key title from to prev=""
+  while IFS=$'\x1f' read -r tag key title from to; do
+    [ -n "${tag:-}" ] || continue
+    if [ "$tag" != "$prev" ]; then
+      [ -n "$prev" ] && echo "---"
+      case "$tag" in
+        formula) echo "Homebrew · formulae · $nf | size=11 color=gray" ;;
+        cask) echo "Homebrew · applications · $nc | size=11 color=gray" ;;
+        cask_auto) echo "Self-updating · $nca | size=11 color=gray" ;;
+        mas) echo "App Store · $nm | size=11 color=gray" ;;
+      esac
+      [ "$tag" = "mas" ] && [ "$inst_m" -eq 0 ] && echo "-- Looks like you are not signed in to the App Store | color=orange size=11"
+      prev=$tag
+    fi
+
+    case "$tag" in
+      formula)
+        echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=upgrade param2=formula param3=$key terminal=false sfimage=arrow.up.circle tooltip=\"brew upgrade $key\""
+        echo "Skip $title ${to} | alternate=true bash=$SELF param1=skip param2=$key param3=$to terminal=false sfimage=hand.raised tooltip=\"Never offer $title $to again\""
+        ;;
+      cask)
+        echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=term param2=upgrade param3=cask param4=$key terminal=false sfimage=arrow.up.circle tooltip=\"brew upgrade --cask $key\""
+        echo "Skip $title ${to} | alternate=true bash=$SELF param1=skip param2=$key param3=$to terminal=false sfimage=hand.raised tooltip=\"Never offer $title $to again\""
+        ;;
+      cask_auto)
+        echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=term param2=upgrade param3=cask param4=$key terminal=false sfimage=arrow.up.circle tooltip=\"this app updates itself, brew upgrade is optional\""
+        echo "Skip $title ${to} | alternate=true bash=$SELF param1=skip param2=$key param3=$to terminal=false sfimage=hand.raised tooltip=\"Never offer $title $to again\""
+        ;;
+      mas)
+        echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=term param2=upgrade param3=mas param4=$key terminal=false sfimage=arrow.up.circle tooltip=\"mas update $key\""
+        ;;
+    esac
+  done < <(printf '%s\n' "$map" | tail -n +2)
+
+  echo "---"
+  echo "Clean up old versions (brew cleanup) | bash=$SELF param1=cleanup terminal=false sfimage=trash tooltip=\"Remove old versions and downloaded files\""
+  echo "Check log | bash=/usr/bin/open param1=-t param2=$LOG terminal=false sfimage=doc.text tooltip=\"$LOG\""
+}
+
+case "${1:-menu}" in
+  menu) cmd_menu ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  upgrade) shift; cmd_upgrade "$@" ;;
+  upgrade-all) cmd_upgrade_all ;;
+  term) shift; cmd_term "$@" ;;
+  skip) shift; cmd_skip "$@" ;;
+  cleanup) cmd_cleanup ;;
+  parse-brew) norm_brew ;;
+  parse-mas) norm_mas ;;
+  filter) shift; norm_brew <"${3:-/dev/stdin}" | filter_ignore "${1:-}" | filter_skip "${2:-}" ;;
+  *)
+    printf 'usage: app-updates {menu|refresh|upgrade-all|upgrade|skip|cleanup|term}\n' >&2
+    exit 2
+    ;;
+esac
