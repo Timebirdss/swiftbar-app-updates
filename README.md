@@ -5,6 +5,10 @@
 
 **Homebrew + Mac App Store updates, right in your macOS menu bar.**
 
+![The menu](docs/menu.png)
+
+<sub>Preview rendered from the plugin's real output (`tools/preview.swift`) — no stale screenshots.</sub>
+
 A menu bar icon shows *how many* packages can be upgraded. One click shows *which* ones and their exact
 versions, and upgrades them — one package, one category, or everything at once.
 
@@ -63,6 +67,14 @@ versions, and upgrades them — one package, one category, or everything at once
 
 ## Install
 
+With Homebrew (recommended):
+
+```bash
+brew install --cask Timebirdss/tap/app-updates
+```
+
+Or from source:
+
 ```bash
 git clone https://github.com/Timebirdss/swiftbar-app-updates.git
 cd swiftbar-app-updates
@@ -72,7 +84,8 @@ cd swiftbar-app-updates
 The script copies the helper to `~/.local/bin/app-updates`, the plugin to your SwiftBar plugin folder,
 creates a config, runs the first check and asks SwiftBar to reload.
 
-Uninstall with `./uninstall.sh` (add `--purge` to delete the config too).
+Uninstall with `brew uninstall --cask app-updates`, or `./uninstall.sh` for a source install
+(add `--purge` to delete the config too).
 
 ## Usage
 
@@ -151,6 +164,9 @@ launching a `.command` file instead; if you still see it, please open an issue w
 ```bash
 ./tests/run.sh          # smoke tests, fixtures only, no Homebrew needed
 shellcheck bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh
+
+# refresh the screenshot in the README (macOS, needs the Swift toolchain)
+./bin/app-updates menu | swift tools/preview.swift docs/menu.png
 ```
 
 Pull requests are welcome; keep the menu render path allocation-free (one `jq` call) and add a fixture
