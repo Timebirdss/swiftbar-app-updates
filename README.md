@@ -164,7 +164,7 @@ launching a `.command` file instead; if you still see it, please open an issue w
 ## Development
 
 ```bash
-./tests/run.sh          # 46 checks: parsers, menu and the whole refresh path with stubbed brew/mas
+./tests/run.sh          # parsers, menu, and the whole refresh path with stubbed brew/mas
 shellcheck bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh
 ```
 
