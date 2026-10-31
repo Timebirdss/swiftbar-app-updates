@@ -49,6 +49,21 @@ else
   MAS=$(pick "$(command -v mas 2>/dev/null)" /opt/homebrew/bin/mas /usr/local/bin/mas) || MAS=""
 fi
 JQ=$(pick "$(command -v jq 2>/dev/null)" /opt/homebrew/bin/jq /usr/local/bin/jq) || JQ=""
+if [ -n "${APP_UPDATES_CURL+x}" ]; then
+  CURL=$APP_UPDATES_CURL
+else
+  CURL=$(pick /usr/bin/curl /opt/homebrew/bin/curl) || CURL=""
+fi
+if [ -n "${APP_UPDATES_PLUTIL+x}" ]; then
+  PLUTIL=$APP_UPDATES_PLUTIL
+else
+  PLUTIL=$(pick /usr/bin/plutil) || PLUTIL="plutil"
+fi
+if [ -n "${APP_UPDATES_GH+x}" ]; then
+  GH=$APP_UPDATES_GH
+else
+  GH=$(pick "$(command -v gh 2>/dev/null)" /opt/homebrew/bin/gh /usr/local/bin/gh) || GH=""
+fi
 OPEN=$(pick /usr/bin/open) || OPEN="open"
 OSA=$(pick /usr/bin/osascript) || OSA="osascript"
 DATE=$(pick /bin/date) || DATE="date"
@@ -68,6 +83,8 @@ MAS_TIMEOUT=600
 PROXY=""
 IGNORE=""
 SKIP=""
+SPARKLE="auto"   # auto: find apps that ship a Sparkle feed (SUFeedURL); off: skip them
+GITHUB=""        # apps installed by hand from GitHub releases: "owner/repo=1.2.3 ..."
 TTL=21600              # check at most every 6 hours
 STALE_AFTER=43200      # show "data is stale" after 12 hours
 BREW_UPDATE_TTL=21600  # brew update at most every 6 hours
@@ -162,6 +179,120 @@ mark_auto_casks() {
   "$JQ" --argjson au "$au_json" '.casks = [(.casks // [])[] | . + {auto: ($au[.name] // false)}]' \
     "$file" >"$file.tmp" 2>>"$LOG" && mv "$file.tmp" "$file"
   log "auto_updates: $(( $(now) - t0 )) s"
+}
+
+# --- third-party update feeds ------------------------------------------------
+# true when $1 is newer than $2 (numeric dotted segments, suffixes ignored)
+version_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    na=split(a,A,"."); nb=split(b,B,".");
+    n=(na>nb?na:nb);
+    for(i=1;i<=n;i++){x=A[i]+0; y=B[i]+0; if(x>y){print "1"; exit} if(x<y){print "0"; exit}}
+    print "0"}'
+}
+
+# Sparkle appcast on stdin → "<version>\t<download url>" of the newest item.
+# Handles both layouts: attributes on <enclosure> (Sparkle 1) and child
+# elements <sparkle:version>/<sparkle:shortVersionString> (Sparkle 2).
+parse_appcast() {
+  local xml short version url
+  xml=$(cat)
+  [ -n "$xml" ] || return 1
+
+  xpath() { printf '%s' "$xml" | xmllint --xpath "string($1)" - 2>/dev/null; }
+
+  url=$(xpath '(//item)[1]/enclosure/@url')
+  short=$(xpath '(//item)[1]/*[local-name()="shortVersionString"]')
+  [ -n "$short" ] || short=$(xpath '(//item)[1]/enclosure/@*[local-name()="shortVersionString"]')
+  if [ -z "$short" ]; then
+    version=$(xpath '(//item)[1]/*[local-name()="version"]')
+    [ -n "$version" ] || version=$(xpath '(//item)[1]/enclosure/@*[local-name()="version"]')
+    # A bare build number (180) is not comparable with CFBundleShortVersionString.
+    case "$version" in
+      *.*) short=$version ;;
+      *) short="" ;;
+    esac
+  fi
+  [ -n "$url" ] && [ -n "$short" ] || return 1
+  printf '%s\t%s\n' "$short" "$url"
+}
+
+# Apps that carry a Sparkle feed: "<name>\t<path>\t<feed url>"
+discover_sparkle() {
+  local dirs d app plist feed name
+  dirs=${APP_UPDATES_APP_DIRS:-"$HOME/Applications:/Applications"}
+  printf '%s\n' "$dirs" | tr ':' '\n' | while IFS= read -r d; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    for app in "$d"/*.app; do
+      [ -d "$app" ] || continue
+      plist="$app/Contents/Info.plist"
+      [ -f "$plist" ] || continue
+      feed=$("$PLUTIL" -extract SUFeedURL raw -o - "$plist" 2>/dev/null) || continue
+      [ -n "$feed" ] || continue
+      name=$(basename "$app" .app)
+      printf '%s\t%s\t%s\n' "$name" "$app" "$feed"
+    done
+  done
+}
+
+# "AppCleaner" → "appcleaner", to compare against cask tokens
+cask_key() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9'; }
+
+# Is this name/version muted by SKIP?
+is_skipped() {
+  local name=$1 ver=$2 e
+  [ -n "${SKIP:-}" ] || return 1
+  for e in $SKIP; do
+    case "$e" in
+      "$name=$ver" | "$name=") return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Sparkle apps not managed by Homebrew (brew casks are already covered there)
+fetch_sparkle() {
+  local casks=${1:-} name path feed installed newest to url key acc="[]"
+  [ "${SPARKLE:-auto}" = "off" ] && { printf '[]'; return 0; }
+  [ -n "$CURL" ] || { printf '[]'; return 0; }
+  while IFS=$'\t' read -r name path feed; do
+    [ -n "${name:-}" ] || continue
+    key=$(cask_key "$name")
+    [ -n "$casks" ] && grep -qx "$key" "$casks" 2>/dev/null && continue
+    installed=$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$path/Contents/Info.plist" 2>/dev/null)
+    [ -n "$installed" ] || continue
+    newest=$("$CURL" -fsSL -m 8 --retry 1 "$feed" 2>/dev/null | parse_appcast) || continue
+    [ -n "$newest" ] || continue
+    to=${newest%%$'\t'*}
+    url=${newest#*$'\t'}
+    [ -n "$to" ] || continue
+    [ "$(version_gt "$to" "$installed")" = "1" ] || continue
+    is_skipped "$name" "$to" && continue
+    acc=$(printf '%s' "$acc" | "$JQ" -c --arg n "$name" --arg f "$installed" --arg t "$to" --arg u "$url" \
+      '. + [{name: $n, from: $f, to: $t, url: $u}]')
+  done < <(discover_sparkle)
+  printf '%s' "$acc"
+}
+
+# Hand-installed tools from GitHub releases: "owner/repo=installed-version"
+fetch_github() {
+  local acc="[]" entry repo have tag to url
+  [ -n "${GITHUB:-}" ] || { printf '[]'; return 0; }
+  [ -n "${GH:-}" ] || { printf '[]'; return 0; }
+  for entry in $GITHUB; do
+    repo=${entry%%=*}
+    have=""
+    case "$entry" in *=*) have=${entry#*=} ;; esac
+    tag=$("$GH" api "repos/$repo/releases/latest" --jq '.tag_name' 2>/dev/null) || continue
+    [ -n "$tag" ] || continue
+    to=${tag#v}
+    [ -n "$have" ] && [ "$(version_gt "$to" "$have")" != "1" ] && continue
+    is_skipped "$repo" "$to" && continue
+    url=$("$GH" api "repos/$repo/releases/latest" --jq '.html_url' 2>/dev/null)
+    acc=$(printf '%s' "$acc" | "$JQ" -c --arg r "$repo" --arg f "${have:-?}" --arg t "$to" --arg u "$url" \
+      '. + [{repo: $r, from: $f, to: $t, url: $u}]')
+  done
+  printf '%s' "$acc"
 }
 
 # --- one check at a time -----------------------------------------------------
@@ -261,6 +392,22 @@ cmd_refresh() {
     err="${err}mas not found. "
   fi
 
+  # Third-party feeds: Sparkle appcasts and hand-installed GitHub releases.
+  local casks_file="$CACHE/casks.txt" sparkle_json github_json c
+  if [ -n "$BREW" ]; then
+    "$BREW" list --cask 2>/dev/null | while IFS= read -r c; do cask_key "$c"; done >"$casks_file"
+  else
+    : >"$casks_file"
+  fi
+  t0=$(now)
+  sparkle_json=$(fetch_sparkle "$casks_file")
+  [ -n "$sparkle_json" ] || sparkle_json='[]'
+  log "sparkle: $(( $(now) - t0 )) s"
+  t0=$(now)
+  github_json=$(fetch_github)
+  [ -n "$github_json" ] || github_json='[]'
+  log "github releases: $(( $(now) - t0 )) s"
+
   # raw → normalized → self-updating flags → IGNORE → SKIP
   if [ -s "$raw" ]; then
     norm_brew <"$raw" >"$norm.tmp" 2>>"$LOG" && mv "$norm.tmp" "$norm"
@@ -290,10 +437,12 @@ cmd_refresh() {
     --argjson mok "$mas_ok" \
     --argjson nf "$n_f" --argjson nc "$n_c" --argjson nm "$n_m" \
     --arg err "$err" --arg v "$VERSION" \
+    --argjson sp "$sparkle_json" --argjson gh "$github_json" \
     --slurpfile b "$norm" --slurpfile m "$masnorm" '
       {version: $v, ts: $ts,
        brew: {ok: ($bok == 1), formulae: ($b[0].formulae // []), casks: ($b[0].casks // [])},
        mas: {ok: ($mok == 1), apps: ($m[0] // [])},
+       sparkle: $sp, github: $gh,
        installed: {formulae: $nf, casks: $nc, mas: $nm},
        error: $err}' >"$STATE.tmp" 2>>"$LOG" && mv "$STATE.tmp" "$STATE"
 
@@ -394,6 +543,8 @@ cmd_term() {
   "$OPEN" "$f" 2>/dev/null
 }
 
+cmd_open_url() { "$OPEN" "$1" >/dev/null 2>&1; }
+
 cmd_skip() {
   local name=$1 ver=${2:-} tmp
   [ -n "${name:-}" ] || return 2
@@ -451,10 +602,12 @@ cmd_menu() {
   # One jq pass for the whole menu: opening it must not wait for five processes.
   local map meta
   map=$("$JQ" -r '
-    "META\u001f\(.ts // 0)\u001f\((.brew.formulae // []) | length)\u001f\(([(.brew.casks // [])[] | select(.auto != true)] | length))\u001f\(([(.brew.casks // [])[] | select(.auto == true)] | length))\u001f\((.mas.apps // []) | length)\u001f\(.installed.formulae // 0)\u001f\(.installed.casks // 0)\u001f\(.installed.mas // 0)\u001f\([.brew.formulae[].name, ((.brew.casks // [])[] | select(.auto != true) | .name), ((.mas.apps // [])[] | .name)] | if length > 7 then .[0:7] + ["…"] else . end | join(", "))\u001f\(.error // "")",
-    ((.brew.formulae // [])[] | ["formula", .name, .name, ((.from // []) | join(", ")), .to] | join("\u001f")),
-    ((.brew.casks // [])[] | (if .auto == true then ["cask_auto", .name, .name, ((.from // []) | join(", ")), .to] else ["cask", .name, .name, ((.from // []) | join(", ")), .to] end) | join("\u001f")),
-    ((.mas.apps // [])[] | ["mas", (.id | tostring), .name, .from, .to] | join("\u001f"))
+    "META\u001f\(.ts // 0)\u001f\((.brew.formulae // []) | length)\u001f\(([(.brew.casks // [])[] | select(.auto != true)] | length))\u001f\(([(.brew.casks // [])[] | select(.auto == true)] | length))\u001f\((.mas.apps // []) | length)\u001f\((.sparkle // []) | length)\u001f\((.github // []) | length)\u001f\(.installed.formulae // 0)\u001f\(.installed.casks // 0)\u001f\(.installed.mas // 0)\u001f\([.brew.formulae[].name, ((.brew.casks // [])[] | select(.auto != true) | .name), ((.mas.apps // [])[] | .name), ((.sparkle // [])[] | .name), ((.github // [])[] | .repo)] | if length > 7 then .[0:7] + ["…"] else . end | join(", "))\u001f\(.error // "")",
+    ((.brew.formulae // [])[] | ["formula", .name, .name, ((.from // []) | join(", ")), .to, ""] | join("\u001f")),
+    ((.brew.casks // [])[] | (if .auto == true then ["cask_auto", .name, .name, ((.from // []) | join(", ")), .to, ""] else ["cask", .name, .name, ((.from // []) | join(", ")), .to, ""] end) | join("\u001f")),
+    ((.mas.apps // [])[] | ["mas", (.id | tostring), .name, .from, .to, ""] | join("\u001f")),
+    ((.sparkle // [])[] | ["sparkle", .name, .name, .from, .to, .url] | join("\u001f")),
+    ((.github // [])[] | ["github", .repo, .repo, .from, .to, .url] | join("\u001f"))
   ' "$STATE" 2>/dev/null)
 
   if [ -z "$map" ]; then
@@ -465,15 +618,17 @@ cmd_menu() {
     return 0
   fi
 
-  local _m ts nf nc nca nm inst_f inst_c inst_m names err n
+  local _m ts nf nc nca nm nsp ngh inst_f inst_c inst_m names err n
   meta=$(printf '%s\n' "$map" | head -n 1)
-  IFS=$'\x1f' read -r _m ts nf nc nca nm inst_f inst_c inst_m names err <<<"$meta"
+  IFS=$'\x1f' read -r _m ts nf nc nca nm nsp ngh inst_f inst_c inst_m names err <<<"$meta"
+  case "$nsp" in '' | *[!0-9]*) nsp=0 ;; esac
+  case "$ngh" in '' | *[!0-9]*) ngh=0 ;; esac
   case "$ts" in '' | *[!0-9]*) ts=0 ;; esac
   case "$nf" in '' | *[!0-9]*) nf=0 ;; esac
   case "$nc" in '' | *[!0-9]*) nc=0 ;; esac
   case "$nca" in '' | *[!0-9]*) nca=0 ;; esac
   case "$nm" in '' | *[!0-9]*) nm=0 ;; esac
-  n=$((nf + nc + nm))
+  n=$((nf + nc + nm + nsp + ngh))
 
   now_s=$(now)
   age=$((now_s - ts))
@@ -521,8 +676,8 @@ cmd_menu() {
     echo "Check now | bash=$SELF param1=refresh terminal=false sfimage=arrow.clockwise tooltip=\"brew update + brew outdated + mas outdated\""
   fi
 
-  local tag key title from to prev=""
-  while IFS=$'\x1f' read -r tag key title from to; do
+  local tag key title from to url prev=""
+  while IFS=$'\x1f' read -r tag key title from to url; do
     [ -n "${tag:-}" ] || continue
     if [ "$tag" != "$prev" ]; then
       [ -n "$prev" ] && echo "---"
@@ -530,6 +685,8 @@ cmd_menu() {
         formula) echo "Homebrew · formulae · $nf | size=11 color=gray" ;;
         cask) echo "Homebrew · applications · $nc | size=11 color=gray" ;;
         cask_auto) echo "Self-updating · $nca | size=11 color=gray" ;;
+        sparkle) echo "Sparkle · $nsp | size=11 color=gray" ;;
+        github) echo "GitHub Releases · $ngh | size=11 color=gray" ;;
         mas) echo "App Store · $nm | size=11 color=gray" ;;
       esac
       [ "$tag" = "mas" ] && [ "$inst_m" -eq 0 ] && echo "-- Looks like you are not signed in to the App Store | color=orange size=11"
@@ -552,6 +709,14 @@ cmd_menu() {
       mas)
         echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=term param2=upgrade param3=mas param4=$key terminal=false sfimage=arrow.up.circle tooltip=\"mas update $key\""
         ;;
+      sparkle)
+        echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=open-url param2=$url terminal=false sfimage=arrow.down.circle tooltip=\"Sparkle feed: download page\""
+        echo "Skip $title ${to} | alternate=true bash=$SELF param1=skip param2=$key param3=$to terminal=false sfimage=hand.raised tooltip=\"Never offer $title $to again\""
+        ;;
+      github)
+        echo "$title · ${from:-?} → ${to:-?} | bash=$SELF param1=open-url param2=$url terminal=false sfimage=arrow.down.circle tooltip=\"GitHub release page\""
+        echo "Skip $title ${to} | alternate=true bash=$SELF param1=skip param2=$key param3=$to terminal=false sfimage=hand.raised tooltip=\"Never offer $title $to again\""
+        ;;
     esac
   done < <(printf '%s\n' "$map" | tail -n +2)
 
@@ -568,6 +733,9 @@ case "${1:-menu}" in
   term) shift; cmd_term "$@" ;;
   skip) shift; cmd_skip "$@" ;;
   cleanup) cmd_cleanup ;;
+  open-url) shift; cmd_open_url "$@" ;;
+  parse-appcast) parse_appcast ;;
+  version-gt) shift; version_gt "${1:-}" "${2:-}" ;;
   parse-brew) norm_brew ;;
   parse-mas) norm_mas ;;
   filter) shift; norm_brew <"${3:-/dev/stdin}" | filter_ignore "${1:-}" | filter_skip "${2:-}" ;;

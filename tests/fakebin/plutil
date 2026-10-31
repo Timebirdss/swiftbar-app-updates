@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stub: plutil -extract KEY raw -o - PLIST
+case "${2:-}" in
+  SUFeedURL) printf 'https://appcast.test/testapp.xml\n' ;;
+  CFBundleShortVersionString) printf '1.0.0\n' ;;
+  *) exit 1 ;;
+esac

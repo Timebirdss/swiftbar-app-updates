@@ -1,0 +1,6 @@
+#!/bin/bash
+# Stub: serves the appcast fixture, fails for anything else.
+case "$*" in
+  *appcast.test*) cat "${FAKE_APPCAST:?}" ;;
+  *) exit 22 ;;
+esac

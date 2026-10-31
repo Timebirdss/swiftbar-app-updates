@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck libxml2-utils
 
       - name: ShellCheck
         run: shellcheck -S warning bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh tests/run.sh

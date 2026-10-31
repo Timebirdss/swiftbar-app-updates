@@ -39,6 +39,14 @@ IGNORE=""
 # Versions to skip (space separated "name=version"). "name=" skips forever.
 SKIP=""
 
+# Apps that update through a Sparkle feed and are not managed by Homebrew are
+# found automatically ("auto"). Set "off" to ignore them.
+SPARKLE="auto"
+
+# Tools installed by hand from GitHub releases: "owner/repo=installed-version".
+# GITHUB="cli/cli=2.40.0 owner/tool=1.2.3"
+GITHUB=""
+
 # How often the plugin re-checks, in seconds. Default: 6 hours.
 # TTL=21600
 CONF

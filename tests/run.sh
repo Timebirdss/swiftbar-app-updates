@@ -62,6 +62,37 @@ check "skip keeps other versions" 2 "$(printf '%s' "$out" | jq '.formulae | leng
 out=$("$BIN" filter "" "git=" "$FIX/brew.json")
 check "skip without version drops forever" 1 "$(printf '%s' "$out" | jq '.formulae | length')"
 
+echo "== version comparison"
+check "1.2.0 newer than 1.1.9" "1" "$("$BIN" version-gt 1.2.0 1.1.9)"
+check "1.10 newer than 1.9" "1" "$("$BIN" version-gt 1.10 1.9)"
+check "equal versions" "0" "$("$BIN" version-gt 1.2.0 1.2.0)"
+check "older is not newer" "0" "$("$BIN" version-gt 1.1.9 1.2.0)"
+
+echo "== appcast parsing"
+appcast=$("$BIN" parse-appcast <"$FIX/appcast.xml")
+check "newest item version" "1.2.0" "${appcast%%$'\t'*}"
+check "newest item url" "https://example.com/TestApp-1.2.0.dmg" "${appcast#*$'\t'}"
+
+appcast2=$("$BIN" parse-appcast <"$FIX/appcast-v2.xml")
+check "Sparkle 2 shortVersionString" "2.0.0" "${appcast2%%$'\t'*}"
+check "Sparkle 2 enclosure url" "https://example.com/TestApp-2.0.0.dmg" "${appcast2#*$'\t'}"
+
+echo "== menu with third-party feeds"
+tmp2=$(mktemp -d)
+jq -n --argjson ts "$(date +%s)" '{version: "1.0.0", ts: $ts,
+  brew: {ok: true, formulae: [], casks: []},
+  mas: {ok: true, apps: []},
+  sparkle: [{name: "IINA", from: "1.3.0", to: "1.4.0", url: "https://example.com/iina.dmg"}],
+  github: [{repo: "acme/tool", from: "1.5.0", to: "2.0.0", url: "https://github.com/acme/tool/releases/tag/v2.0.0"}],
+  installed: {formulae: 100, casks: 12, mas: 1}, error: ""}' >"$tmp2/state.json"
+menu=$(APP_UPDATES_STATE="$tmp2/state.json" APP_UPDATES_CACHE="$tmp2" APP_UPDATES_NO_UI=1 "$BIN" menu)
+first=$(printf '%s\n' "$menu" | head -n 1)
+check "badge counts feeds too" "2" "${first%% |*}"
+contains "sparkle group" "Sparkle · 1" "$menu"
+contains "github group" "GitHub Releases · 1" "$menu"
+contains "sparkle opens download" "param1=open-url param2=https://example.com/iina.dmg" "$menu"
+contains "github opens release page" "param1=open-url param2=https://github.com/acme/tool/releases/tag/v2.0.0" "$menu"
+
 echo "== menu"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -117,12 +148,19 @@ mkdir -p "$tmp/cache" "$tmp/conf"
 cat >"$tmp/conf/config" <<'CONF'
 IGNORE="electerm"
 SKIP="git=2.48.1"
+SPARKLE="auto"
+GITHUB="acme/tool=1.5.0"
 CONF
 
 refresh_env=(
   env
   APP_UPDATES_BREW="$ROOT/tests/fakebin/brew"
   APP_UPDATES_MAS="$ROOT/tests/fakebin/mas"
+  APP_UPDATES_CURL="$ROOT/tests/fakebin/curl"
+  APP_UPDATES_GH="$ROOT/tests/fakebin/gh"
+  APP_UPDATES_PLUTIL="$ROOT/tests/fakebin/plutil"
+  APP_UPDATES_APP_DIRS="$FIX/apps"
+  FAKE_APPCAST="$FIX/appcast.xml"
   APP_UPDATES_CACHE="$tmp/cache"
   APP_UPDATES_CONFIG="$tmp/conf/config"
   APP_UPDATES_NO_UI=1
@@ -148,6 +186,13 @@ check "installed counts" "3/2/2" \
   "$(jq -r '"\(.installed.formulae)/\(.installed.casks)/\(.installed.mas)"' "$state")"
 check "mas apps parsed" "2" "$(jq -r '.mas.apps | length' "$state")"
 check "state has the plugin version" "1.0.0" "$(jq -r '.version' "$state")"
+check "sparkle: one update found" "1" "$(jq -r '.sparkle | length' "$state")"
+check "sparkle: version from feed" "1.2.0" "$(jq -r '.sparkle[0].to' "$state")"
+check "sparkle: installed version" "1.0.0" "$(jq -r '.sparkle[0].from' "$state")"
+check "sparkle: download url" "https://example.com/TestApp-1.2.0.dmg" "$(jq -r '.sparkle[0].url' "$state")"
+check "github: one update found" "1" "$(jq -r '.github | length' "$state")"
+check "github: tag without v" "2.0.0" "$(jq -r '.github[0].to' "$state")"
+check "github: release url" "https://github.com/acme/tool/releases/tag/v2.0.0" "$(jq -r '.github[0].url' "$state")"
 
 echo "== refresh: brew failure"
 mkdir -p "$tmp/cache2"

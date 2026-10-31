@@ -50,6 +50,9 @@ versions, and upgrades them — one package, one category, or everything at once
   command it will run.
 - **“Skip this version” is one Option-click away.** Some updates break things; you should be able to
   say “not this one” without muting the package forever.
+- **Beyond Homebrew.** Apps that ship a Sparkle feed (IINA, AppCleaner, Keka, Maccy…) and tools you
+  installed by hand from GitHub releases are checked too. Sparkle apps are discovered automatically
+  from their `SUFeedURL`, and anything Homebrew already manages is skipped so nothing is counted twice.
 - **Nothing hangs.** Every upgrade runs with a timeout (30 min for formulae that build from source,
   10 min for apps), because Homebrew’s `curl` has none and a stalled mirror can wait forever.
 - **No stray Terminal windows.** Upgrades that need a TTY are launched through a `.command` file, so
@@ -96,7 +99,7 @@ Uninstall with `brew uninstall --cask app-updates`, or `./uninstall.sh` for a so
 | Menu bar icon | number of real updates; grey when everything is up to date |
 | **Upgrade all** | formulae, then apps, then App Store — one by one, failures do not stop the rest |
 | **Check now** | force a check without waiting for the 6-hour schedule |
-| row click | upgrade that single package |
+| row click | upgrade that single package (or open the download page for Sparkle/GitHub rows) |
 | **⌥ + row click** | skip that version permanently |
 | **Clean up old versions** | `brew cleanup --prune=all`, reports how much was freed |
 | **Check log** | opens the refresh log |
@@ -115,6 +118,14 @@ IGNORE=""
 
 # Versions to skip: "name=version". "name=" skips the package forever.
 SKIP=""
+
+# Self-updating apps with a Sparkle feed, discovered from Info.plist (SUFeedURL).
+# "off" disables the section.
+SPARKLE="auto"
+
+# Tools installed by hand from GitHub releases: "owner/repo=installed-version".
+# The plugin compares that version with the latest release tag.
+GITHUB="cli/cli=2.40.0 owner/tool=1.2.3"
 
 # How often to check, in seconds (default 6 hours).
 TTL=21600
@@ -148,6 +159,10 @@ lower `TTL` in the config.
 **The badge number never matches `brew outdated`.** It should: formulae + non-self-updating casks +
 App Store apps. Self-updating casks are excluded on purpose (see above), and they are visible in their
 own section.
+
+**A Sparkle app is missing from the list.** Apps installed through Homebrew are checked as casks and
+skipped by the Sparkle scan on purpose (no double counting). If an app is not found at all, it probably
+does not ship `SUFeedURL` — add a GitHub entry instead.
 
 **An upgrade hangs.** Some casks pull from third-party mirrors that stall. The plugin aborts after the
 timeout and tells you which package it was; the reason ends up in `~/Library/Caches/app-updates/refresh.log`.
