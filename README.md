@@ -7,7 +7,7 @@
 
 ![The menu](docs/menu.png)
 
-<sub>Rendered from the plugin's real output with example data, following macOS dark-mode menu metrics (`tools/preview.swift`).</sub>
+<sub>macOS dark mode, example data.</sub>
 
 A menu bar icon shows *how many* packages can be upgraded. One click shows *which* ones and their exact
 versions, and upgrades them — one package, one category, or everything at once.
@@ -164,9 +164,6 @@ launching a `.command` file instead; if you still see it, please open an issue w
 ```bash
 ./tests/run.sh          # smoke tests, fixtures only, no Homebrew needed
 shellcheck bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh
-
-# refresh the screenshot in the README (macOS, needs the Swift toolchain)
-./bin/app-updates menu | swift tools/preview.swift docs/menu.png
 ```
 
 Pull requests are welcome; keep the menu render path allocation-free (one `jq` call) and add a fixture
