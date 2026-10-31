@@ -112,6 +112,62 @@ menu=$(APP_UPDATES_STATE="$tmp/state.json" APP_UPDATES_CACHE="$tmp" "$BIN" menu)
 contains "error is shown" "Check was incomplete" "$menu"
 contains "error text" "brew outdated failed." "$menu"
 
+echo "== refresh (stubbed brew and mas)"
+mkdir -p "$tmp/cache" "$tmp/conf"
+cat >"$tmp/conf/config" <<'CONF'
+IGNORE="electerm"
+SKIP="git=2.48.1"
+CONF
+
+refresh_env=(
+  env
+  APP_UPDATES_BREW="$ROOT/tests/fakebin/brew"
+  APP_UPDATES_MAS="$ROOT/tests/fakebin/mas"
+  APP_UPDATES_CACHE="$tmp/cache"
+  APP_UPDATES_CONFIG="$tmp/conf/config"
+  APP_UPDATES_NO_UI=1
+  FAKE_BREW_OUTDATED="$FIX/brew.json"
+  FAKE_MAS_OUTDATED="$FIX/mas.jsonl"
+)
+
+"${refresh_env[@]}" "$BIN" refresh --quiet
+state="$tmp/cache/state.json"
+
+check "refresh records brew ok" "true" "$(jq -r '.brew.ok' "$state")"
+check "refresh records mas ok" "true" "$(jq -r '.mas.ok' "$state")"
+check "IGNORE drops the cask" "0" \
+  "$(jq -r '[.brew.casks[] | select(.name == "electerm")] | length' "$state")"
+check "SKIP drops that version" "0" \
+  "$(jq -r '[.brew.formulae[] | select(.name == "git")] | length' "$state")"
+check "other formulae survive" "1" "$(jq -r '.brew.formulae | length' "$state")"
+check "self-updating flag from brew info" "true" \
+  "$(jq -r '.brew.casks[] | select(.name == "zed") | .auto' "$state")"
+check "ordinary cask stays non-auto" "false" \
+  "$(jq -r '.brew.casks[] | select(.name == "dbeaver-community") | .auto' "$state")"
+check "installed counts" "3/2/2" \
+  "$(jq -r '"\(.installed.formulae)/\(.installed.casks)/\(.installed.mas)"' "$state")"
+check "mas apps parsed" "2" "$(jq -r '.mas.apps | length' "$state")"
+check "state has the plugin version" "1.0.0" "$(jq -r '.version' "$state")"
+
+echo "== refresh: brew failure"
+mkdir -p "$tmp/cache2"
+(
+  export APP_UPDATES_BREW="$ROOT/tests/fakebin/brew"
+  export APP_UPDATES_MAS="$ROOT/tests/fakebin/mas"
+  export APP_UPDATES_CACHE="$tmp/cache2"
+  export APP_UPDATES_CONFIG="$tmp/conf/config"
+  export APP_UPDATES_NO_UI=1
+  export FAKE_BREW_OUTDATED="$FIX/brew.json"
+  export FAKE_MAS_OUTDATED="$FIX/mas.jsonl"
+  export FAKE_BREW_FAIL=1
+  "$BIN" refresh --quiet >/dev/null 2>&1 || true
+)
+state2="$tmp/cache2/state.json"
+check "failed brew is recorded" "false" "$(jq -r '.brew.ok' "$state2")"
+contains "error text is kept" "brew outdated failed" "$(jq -r '.error' "$state2")"
+check "no formulae on failure" "0" "$(jq -r '.brew.formulae | length' "$state2")"
+check "App Store still parsed" "2" "$(jq -r '.mas.apps | length' "$state2")"
+
 echo
 if [ "$fails" -eq 0 ]; then
   echo "All tests passed."

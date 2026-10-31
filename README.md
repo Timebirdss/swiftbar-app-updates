@@ -67,20 +67,20 @@ versions, and upgrades them — one package, one category, or everything at once
 
 ## Install
 
-With Homebrew (recommended):
-
-```bash
-brew tap Timebirdss/tap
-brew trust timebirdss/tap        # Homebrew 7+ asks this for third-party taps
-brew install --cask app-updates
-```
-
-Or from source:
+From source (no extra steps):
 
 ```bash
 git clone https://github.com/Timebirdss/swiftbar-app-updates.git
 cd swiftbar-app-updates
 ./install.sh
+```
+
+Or with Homebrew, if you prefer package management:
+
+```bash
+brew tap Timebirdss/tap
+brew trust timebirdss/tap        # Homebrew 7+ asks this for third-party taps
+brew install --cask app-updates
 ```
 
 The script copies the helper to `~/.local/bin/app-updates`, the plugin to your SwiftBar plugin folder,
@@ -164,7 +164,7 @@ launching a `.command` file instead; if you still see it, please open an issue w
 ## Development
 
 ```bash
-./tests/run.sh          # smoke tests, fixtures only, no Homebrew needed
+./tests/run.sh          # 46 checks: parsers, menu and the whole refresh path with stubbed brew/mas
 shellcheck bin/app-updates plugin/app-updates.5m.sh install.sh uninstall.sh
 ```
 

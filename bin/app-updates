@@ -37,9 +37,18 @@ pick() {
   return 1
 }
 
-BREW=$(pick "$(command -v brew 2>/dev/null)" /opt/homebrew/bin/brew /usr/local/bin/brew) || BREW=""
+# APP_UPDATES_BREW / APP_UPDATES_MAS exist so tests can point at stubs.
+if [ -n "${APP_UPDATES_BREW+x}" ]; then
+  BREW=$APP_UPDATES_BREW
+else
+  BREW=$(pick "$(command -v brew 2>/dev/null)" /opt/homebrew/bin/brew /usr/local/bin/brew) || BREW=""
+fi
+if [ -n "${APP_UPDATES_MAS+x}" ]; then
+  MAS=$APP_UPDATES_MAS
+else
+  MAS=$(pick "$(command -v mas 2>/dev/null)" /opt/homebrew/bin/mas /usr/local/bin/mas) || MAS=""
+fi
 JQ=$(pick "$(command -v jq 2>/dev/null)" /opt/homebrew/bin/jq /usr/local/bin/jq) || JQ=""
-MAS=$(pick "$(command -v mas 2>/dev/null)" /opt/homebrew/bin/mas /usr/local/bin/mas) || MAS=""
 OPEN=$(pick /usr/bin/open) || OPEN="open"
 OSA=$(pick /usr/bin/osascript) || OSA="osascript"
 DATE=$(pick /bin/date) || DATE="date"
@@ -163,7 +172,7 @@ acquire_lock() {
   fi
   local pid mtime age
   pid=$(cat "$LOCK/pid" 2>/dev/null)
-  mtime=$(/usr/bin/stat -f %m "$LOCK" 2>/dev/null || /usr/bin/stat -c %Y "$LOCK" 2>/dev/null || echo 0)
+  mtime=$(/usr/bin/stat -c %Y "$LOCK" 2>/dev/null || /usr/bin/stat -f %m "$LOCK" 2>/dev/null || echo 0)
   case "$mtime" in '' | *[!0-9]*) mtime=0 ;; esac
   age=$(( $(now) - mtime ))
   [ "$age" -lt 0 ] && age=0
@@ -181,7 +190,11 @@ acquire_lock() {
 
 release_lock() { rm -rf "$LOCK" 2>/dev/null; }
 
-refresh_ui() { "$OPEN" -g "swiftbar://refreshplugin?name=$PLUGIN" >/dev/null 2>&1; return 0; }
+refresh_ui() {
+  [ -n "${APP_UPDATES_NO_UI:-}" ] && return 0
+  "$OPEN" -g "swiftbar://refreshplugin?name=$PLUGIN" >/dev/null 2>&1
+  return 0
+}
 
 # --- check -------------------------------------------------------------------
 cmd_refresh() {

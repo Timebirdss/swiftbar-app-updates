@@ -1,0 +1,35 @@
+#!/bin/bash
+# Stub for tests: no network, no Homebrew installation required.
+case "${1:-}" in
+  update)
+    exit 0
+    ;;
+  outdated)
+    [ -n "${FAKE_BREW_FAIL:-}" ] && exit 1
+    cat "${FAKE_BREW_OUTDATED:?}"
+    ;;
+  list)
+    case "${2:-}" in
+      --formula) printf 'alpha\nbeta\ngamma\n' ;;
+      --cask) printf 'dbeaver-community\nzed\n' ;;
+      *) : ;;
+    esac
+    ;;
+  info)
+    # info --json=v2 --cask NAME: only zed updates itself
+    name="${4:-}"
+    case "$name" in
+      zed) printf '{"casks":[{"auto_updates":true}]}' ;;
+      *) printf '{"casks":[{"auto_updates":false}]}' ;;
+    esac
+    ;;
+  upgrade)
+    exit 0
+    ;;
+  cleanup)
+    printf '==> This operation has freed approximately 1.2GB of disk space.\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
