@@ -37,6 +37,11 @@ check "formula shape" "brotli|1.2.0|1.2.1" \
 check "cask auto defaults to false" "false" \
   "$(printf '%s' "$out" | jq -r '.casks[0].auto')"
 
+echo "== parse-brew: empty input"
+out=$("$BIN" parse-brew <"$FIX/brew-empty.json")
+check "empty formulae" 0 "$(printf '%s' "$out" | jq '.formulae | length')"
+check "empty casks" 0 "$(printf '%s' "$out" | jq '.casks | length')"
+
 echo "== parse-mas"
 out=$("$BIN" parse-mas <"$FIX/mas.jsonl")
 check "mas count" 2 "$(printf '%s' "$out" | jq 'length')"
