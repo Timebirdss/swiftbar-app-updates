@@ -70,7 +70,9 @@ versions, and upgrades them — one package, one category, or everything at once
 With Homebrew (recommended):
 
 ```bash
-brew install --cask Timebirdss/tap/app-updates
+brew tap Timebirdss/tap
+brew trust timebirdss/tap        # Homebrew 7+ asks this for third-party taps
+brew install --cask app-updates
 ```
 
 Or from source:
