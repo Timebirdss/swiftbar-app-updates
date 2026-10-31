@@ -7,7 +7,7 @@
 
 ![The menu](docs/menu.png)
 
-<sub>Preview rendered from the plugin's real output (`tools/preview.swift`) — no stale screenshots.</sub>
+<sub>Rendered from the plugin's real output with example data, following macOS dark-mode menu metrics (`tools/preview.swift`).</sub>
 
 A menu bar icon shows *how many* packages can be upgraded. One click shows *which* ones and their exact
 versions, and upgrades them — one package, one category, or everything at once.
